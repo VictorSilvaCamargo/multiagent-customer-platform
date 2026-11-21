@@ -8,6 +8,7 @@ from customer_platform.llm.ollama_client import (
     LLMServiceUnavailableError,
     LLMTimeoutError,
     OllamaClient,
+    ToolCallRequest,
 )
 
 __all__ = [
@@ -18,4 +19,5 @@ __all__ = [
     "LLMServiceUnavailableError",
     "LLMTimeoutError",
     "OllamaClient",
+    "ToolCallRequest",
 ]

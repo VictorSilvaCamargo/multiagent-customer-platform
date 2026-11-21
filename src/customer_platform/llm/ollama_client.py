@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -43,12 +44,29 @@ class ChatMessage:
 
 
 @dataclass(frozen=True)
+class ToolCallRequest:
+    """Structured representation of a tool call requested by the model."""
+
+    name: str
+    arguments: dict[str, Any]
+    raw_arguments: Any = None
+    is_valid: bool = True
+    error: str | None = None
+
+
+@dataclass(frozen=True)
 class ChatResponse:
     """Minimal normalized response returned by a chat completion call."""
 
     content: str
     model: str
     done_reason: str | None = None
+    tool_calls: tuple[ToolCallRequest, ...] = ()
+
+    @property
+    def has_tool_calls(self) -> bool:
+        """Return True if the model returned one or more tool call requests."""
+        return bool(self.tool_calls)
 
 
 def _normalize_message(message: ChatMessage | Mapping[str, str]) -> dict[str, str]:
@@ -70,25 +88,124 @@ def _normalize_message(message: ChatMessage | Mapping[str, str]) -> dict[str, st
     return {"role": role, "content": content}
 
 
+def _parse_single_tool_call(raw_call: Any) -> ToolCallRequest:
+    fn = raw_call.get("function") if isinstance(raw_call, Mapping) else getattr(
+        raw_call, "function", None
+    )
+    if fn is None:
+        return ToolCallRequest(
+            name="",
+            arguments={},
+            raw_arguments=raw_call,
+            is_valid=False,
+            error="Tool call is missing the 'function' field.",
+        )
+
+    if isinstance(fn, Mapping):
+        raw_name = fn.get("name")
+        raw_args = fn.get("arguments")
+    else:
+        raw_name = getattr(fn, "name", None)
+        raw_args = getattr(fn, "arguments", None)
+
+    if not isinstance(raw_name, str) or not raw_name.strip():
+        return ToolCallRequest(
+            name="",
+            arguments={},
+            raw_arguments=raw_args,
+            is_valid=False,
+            error="Tool call is missing a valid non-empty function 'name'.",
+        )
+
+    name = raw_name.strip()
+
+    if raw_args is None:
+        return ToolCallRequest(name=name, arguments={}, raw_arguments=raw_args)
+
+    if isinstance(raw_args, Mapping):
+        return ToolCallRequest(name=name, arguments=dict(raw_args), raw_arguments=raw_args)
+
+    if isinstance(raw_args, str):
+        try:
+            decoded = json.loads(raw_args)
+        except json.JSONDecodeError as exc:
+            return ToolCallRequest(
+                name=name,
+                arguments={},
+                raw_arguments=raw_args,
+                is_valid=False,
+                error=f"Malformed JSON in tool arguments for '{name}': {exc.msg}.",
+            )
+        if not isinstance(decoded, dict):
+            return ToolCallRequest(
+                name=name,
+                arguments={},
+                raw_arguments=raw_args,
+                is_valid=False,
+                error=f"Tool arguments JSON for '{name}' must decode to an object.",
+            )
+        return ToolCallRequest(name=name, arguments=decoded, raw_arguments=raw_args)
+
+    return ToolCallRequest(
+        name=name,
+        arguments={},
+        raw_arguments=raw_args,
+        is_valid=False,
+        error=(
+            f"Unsupported tool arguments type for '{name}': {type(raw_args).__name__}."
+        ),
+    )
+
+
+def _parse_tool_calls(raw_tool_calls: Any) -> tuple[ToolCallRequest, ...]:
+    if not raw_tool_calls:
+        return ()
+    if not isinstance(raw_tool_calls, Sequence) or isinstance(raw_tool_calls, (str, bytes)):
+        return (
+            ToolCallRequest(
+                name="",
+                arguments={},
+                raw_arguments=raw_tool_calls,
+                is_valid=False,
+                error="Malformed 'tool_calls' payload returned by Ollama.",
+            ),
+        )
+    return tuple(_parse_single_tool_call(item) for item in raw_tool_calls)
+
+
 def _extract_response(raw_response: Any, *, fallback_model: str) -> ChatResponse:
     if isinstance(raw_response, Mapping):
         message = raw_response.get("message") or {}
-        content = message.get("content", "") if isinstance(message, Mapping) else ""
+        if isinstance(message, Mapping):
+            raw_content = message.get("content", "")
+            raw_tool_calls = message.get("tool_calls")
+        else:
+            raw_content = ""
+            raw_tool_calls = None
         model = raw_response.get("model") or fallback_model
         done_reason = raw_response.get("done_reason")
     else:
         message = getattr(raw_response, "message", None)
         if isinstance(message, Mapping):
-            content = message.get("content", "")
+            raw_content = message.get("content", "")
+            raw_tool_calls = message.get("tool_calls")
+        elif message is not None:
+            raw_content = getattr(message, "content", "")
+            raw_tool_calls = getattr(message, "tool_calls", None)
         else:
-            content = getattr(message, "content", "") if message is not None else ""
+            raw_content = ""
+            raw_tool_calls = None
         model = getattr(raw_response, "model", None) or fallback_model
         done_reason = getattr(raw_response, "done_reason", None)
 
+    content = "" if raw_content is None else str(raw_content)
+    tool_calls = _parse_tool_calls(raw_tool_calls)
+
     return ChatResponse(
-        content=str(content),
+        content=content,
         model=str(model),
         done_reason=str(done_reason) if done_reason is not None else None,
+        tool_calls=tool_calls,
     )
 
 
@@ -125,8 +242,9 @@ class OllamaClient:
         *,
         model: str | None = None,
         think: bool | None = None,
+        tools: Sequence[Mapping[str, Any]] | None = None,
     ) -> ChatResponse:
-        """Send chat messages to Ollama and return a normalized ChatResponse."""
+        """Send chat messages (and optional tools) to Ollama and return a ChatResponse."""
         if not messages:
             raise ValueError("messages must not be empty.")
 
@@ -136,14 +254,17 @@ class OllamaClient:
             raise ValueError("model must not be empty.")
 
         logger.debug(
-            "Sending chat request to Ollama (model=%s, message_count=%d)",
+            "Sending chat request to Ollama (model=%s, message_count=%d, tool_count=%d)",
             target_model,
             len(payload),
+            len(tools) if tools is not None else 0,
         )
 
         chat_kwargs: dict[str, Any] = {}
         if think is not None:
             chat_kwargs["think"] = think
+        if tools is not None:
+            chat_kwargs["tools"] = [dict(tool) for tool in tools]
 
         try:
             raw_response = self._client.chat(
@@ -184,8 +305,9 @@ class OllamaClient:
 
         parsed = _extract_response(raw_response, fallback_model=target_model)
         logger.debug(
-            "Received chat response from Ollama (model=%s, done_reason=%s)",
+            "Received chat response from Ollama (model=%s, done_reason=%s, tool_call_count=%d)",
             parsed.model,
             parsed.done_reason,
+            len(parsed.tool_calls),
         )
         return parsed
