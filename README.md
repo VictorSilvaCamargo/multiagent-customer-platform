@@ -8,13 +8,14 @@ Plataforma educacional multiagente para atendimento ao cliente de uma empresa si
 
 O projeto é construído de forma incremental, com foco em arquitetura limpa, RAG, avaliação automatizada, observabilidade, confiabilidade e segurança.
 
-## Escopo Atual (Fase 1 — Dia 1)
+## Escopo Atual (Fase 1 — Dias 1 e 2)
 
 - Repositório e fluxo Git estruturados (trabalho em branches dedicadas, nunca diretamente na `main`).
-- Estrutura inicial do pacote `customer_platform` em layout `src/`.
+- Estrutura do pacote `customer_platform` em layout `src/`.
 - Configuração centralizada via variáveis de ambiente (`.env`).
-- Cliente base desacoplado para comunicação com o **Ollama** local.
-- Suíte inicial de testes unitários (com mocks) e teste real de integração.
+- Cliente Ollama desacoplado com suporte nativo a `tools` e parsing seguro de `tool_calls`.
+- Contratos Pydantic v2, ferramentas simuladas de telecomunicações (`consultar_planos`, `consultar_fatura`, `abrir_chamado`) e `ToolRegistry` centralizado.
+- Suíte de testes unitários (com mocks) e testes reais de integração com Ollama.
 
 ## Pré-requisitos
 
@@ -79,9 +80,14 @@ multiagent-customer-platform/
 │   └── customer_platform/
 │       ├── __init__.py
 │       ├── config.py
-│       └── llm/
+│       ├── llm/
+│       │   ├── __init__.py
+│       │   └── ollama_client.py
+│       └── tools/
 │           ├── __init__.py
-│           └── ollama_client.py
+│           ├── registry.py
+│           ├── schemas.py
+│           └── telecom.py
 ├── tests/
 │   ├── unit/
 │   └── integration/
