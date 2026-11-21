@@ -15,6 +15,7 @@ from customer_platform.llm import (
     LLMServiceUnavailableError,
     LLMTimeoutError,
     OllamaClient,
+    ToolCallRequest,
 )
 
 
@@ -132,3 +133,156 @@ def test_chat_does_not_log_sensitive_conversation_content(
     assert secret_prompt not in caplog.text
     assert secret_reply not in caplog.text
     assert "qwen3.5:4b" in caplog.text
+
+
+def test_chat_passes_tools_and_parses_sdk_tool_calls() -> None:
+    mock_sdk = MagicMock()
+    mock_sdk.chat.return_value = SimpleNamespace(
+        model="qwen3.5:4b",
+        done_reason="tool_calls",
+        message=SimpleNamespace(
+            content=None,
+            tool_calls=[
+                SimpleNamespace(
+                    function=SimpleNamespace(
+                        name="consultar_fatura",
+                        arguments={"cliente_id": "CLI-001"},
+                    )
+                )
+            ],
+        ),
+    )
+    client = OllamaClient(_make_settings(), client=mock_sdk)
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "consultar_fatura",
+                "description": "Consulta fatura",
+                "parameters": {"type": "object", "properties": {}, "required": []},
+            },
+        }
+    ]
+
+    response = client.chat(
+        [ChatMessage(role="user", content="Veja minha fatura CLI-001")],
+        tools=tools,
+        think=False,
+    )
+
+    mock_sdk.chat.assert_called_once_with(
+        model="qwen3.5:4b",
+        messages=[{"role": "user", "content": "Veja minha fatura CLI-001"}],
+        think=False,
+        tools=tools,
+    )
+    assert response.content == ""
+    assert response.has_tool_calls is True
+    assert response.tool_calls == (
+        ToolCallRequest(
+            name="consultar_fatura",
+            arguments={"cliente_id": "CLI-001"},
+            raw_arguments={"cliente_id": "CLI-001"},
+            is_valid=True,
+            error=None,
+        ),
+    )
+
+
+def test_chat_parses_mapping_response_with_json_string_arguments() -> None:
+    mock_sdk = MagicMock()
+    mock_sdk.chat.return_value = {
+        "model": "qwen3.5:4b",
+        "done_reason": "stop",
+        "message": {
+            "content": "",
+            "tool_calls": [
+                {
+                    "function": {
+                        "name": "consultar_planos",
+                        "arguments": "{}",
+                    }
+                }
+            ],
+        },
+    }
+    client = OllamaClient(_make_settings(), client=mock_sdk)
+
+    response = client.chat([{"role": "user", "content": "Quais planos existem?"}])
+
+    assert response.has_tool_calls is True
+    assert response.tool_calls[0].is_valid is True
+    assert response.tool_calls[0].name == "consultar_planos"
+    assert response.tool_calls[0].arguments == {}
+
+
+def test_chat_without_tool_calls_returns_empty_tuple() -> None:
+    mock_sdk = MagicMock()
+    mock_sdk.chat.return_value = SimpleNamespace(
+        model="qwen3.5:4b",
+        done_reason="stop",
+        message=SimpleNamespace(content="Resposta direta", tool_calls=None),
+    )
+    client = OllamaClient(_make_settings(), client=mock_sdk)
+
+    response = client.chat([ChatMessage(role="user", content="O que é Mbps?")], tools=[])
+
+    assert response.has_tool_calls is False
+    assert response.tool_calls == ()
+    assert response.content == "Resposta direta"
+
+
+@pytest.mark.parametrize(
+    "raw_tool_calls",
+    [
+        [SimpleNamespace(function=None)],
+        [SimpleNamespace(function=SimpleNamespace(name="", arguments={}))],
+        [SimpleNamespace(function=SimpleNamespace(name="consultar_fatura", arguments="{bad json"))],
+        [SimpleNamespace(function=SimpleNamespace(name="consultar_fatura", arguments="[1, 2]"))],
+        [SimpleNamespace(function=SimpleNamespace(name="consultar_fatura", arguments=12345))],
+        "not-a-sequence",
+    ],
+)
+def test_chat_marks_malformed_tool_calls_as_invalid(raw_tool_calls: object) -> None:
+    mock_sdk = MagicMock()
+    mock_sdk.chat.return_value = SimpleNamespace(
+        model="qwen3.5:4b",
+        done_reason="stop",
+        message=SimpleNamespace(content="", tool_calls=raw_tool_calls),
+    )
+    client = OllamaClient(_make_settings(), client=mock_sdk)
+
+    response = client.chat([ChatMessage(role="user", content="Teste")])
+
+    assert response.has_tool_calls is True
+    assert response.tool_calls[0].is_valid is False
+    assert response.tool_calls[0].error is not None
+
+
+def test_chat_does_not_log_sensitive_tool_arguments(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    secret_client_id = "CLI-SECRETO-999"
+    mock_sdk = MagicMock()
+    mock_sdk.chat.return_value = SimpleNamespace(
+        model="qwen3.5:4b",
+        done_reason="stop",
+        message=SimpleNamespace(
+            content="",
+            tool_calls=[
+                SimpleNamespace(
+                    function=SimpleNamespace(
+                        name="consultar_fatura",
+                        arguments={"cliente_id": secret_client_id},
+                    )
+                )
+            ],
+        ),
+    )
+    client = OllamaClient(_make_settings(), client=mock_sdk)
+
+    with caplog.at_level(logging.DEBUG, logger="customer_platform.llm.ollama_client"):
+        client.chat([ChatMessage(role="user", content="Veja fatura")], tools=[])
+
+    assert secret_client_id not in caplog.text
+    assert "tool_call_count=1" in caplog.text
